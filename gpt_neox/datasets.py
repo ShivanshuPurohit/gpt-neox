@@ -3,7 +3,7 @@ from torch.utils.data import Dataset
 from .data_utils import get_tokenizer, natural_sort, skip, FixedSizeOrderedDict
 import random
 import glob
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import re
 import logging
 from itertools import cycle
@@ -11,7 +11,7 @@ from itertools import cycle
 class GPT2Dataset(Dataset):
 
     def __init__(self, glob_pattern, seq_len, seed=1, shuffle_input_filenames=True, pretokenized=True,
-                 filetype="tfrecords", mode="chunks", train=True, tokenizer=None, **kwargs):
+                 filetype="tfrecords", mode="normal", train=True, tokenizer=None, **kwargs):
 
         super().__init__()
         self.files = glob.glob(glob_pattern)  # glob pattern pointing to files
@@ -34,16 +34,13 @@ class GPT2Dataset(Dataset):
         self._get_lens()
 
         self.seq_len = seq_len  # set sequence length
-        self.mode = mode  # set mode ["chunks"]
-        implemented_modes = ["chunks"]
-        if self.mode not in implemented_modes:
-            raise NotImplementedError
-
+        
         self.pretokenized = pretokenized
         if not self.pretokenized:
             raise NotImplementedError  # TODO: tokenize text data on the fly
 
         self.train = train
+        self.mode = mode
 
     def _get_number_of_documents(self, filename):
         # extracts number of files from a filename formatted "<name>_<num_documents>.{filetype}."
@@ -71,19 +68,15 @@ class GPT2Dataset(Dataset):
             lens.append(n_documents)
         self.lens = lens
         self._len = sum(self.lens)
-    
-    def _parse_function(self, example_proto):
-        features = {
-            "text": tf.io.VarLenFeature(tf.int64)
-        }
-        parsed_features = tf.io.parse_single_example(example_proto, features)
-        return tf.sparse.to_dense(parsed_features["text"], parsed_features["text"].dense_shape[0])
+
+    def _parse_single_example(self, example):
+        data = tf.train.Example.FromString(example)
+        data = torch.tensor(list(data.features.feature["text"].int64_list.value), dtype=torch.long)
+        return data
 
     def _process_tfrecord(self, tfrecords_file, resume_idx=None):
-        dataset = tf.data.TFRecordDataset([tfrecords_file])
-        dataset = dataset.map(self._parse_function, num_parallel_calls=1)
-        for example in dataset.as_numpy_iterator():
-            yield torch.tensor(example, dtype=torch.long)
+        for idx, example in enumerate(tf.io.tf_record_iterator(tfrecords_file)):
+            yield self._parse_single_example(example)
 
     def _maybe_process_tfrecord(self, file_idx):
         if self.processed_files.get(file_idx) is None:
@@ -113,22 +106,41 @@ class GPT2Dataset(Dataset):
                 seek_idx)  # parses tfrecord file to a list *once* then stores in memory
         else:
             raise NotImplementedError
-        return chunk[remainder]  # get item from current chunk
+        output = chunk[remainder]
+        assert output is not None
+        assert output.size(0) == (self.seq_len + 1), f"Output shape ({output.size(0)}) != the specified sequence length + 1 ({self.seq_len + 1})"
+        if self.mode == "normal":
+            return output
+        elif self.mode == 'with_labels':
+            x_seq = output[:-1]
+            y_seq = output[1:]
+            return x_seq, y_seq
+        else:
+            raise ValueError(f'mode {self.mode} not recognized')
 
     def __len__(self):
         return self._len
 
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
+    def __init__(self, data, seq_len, mode="normal"):
         super().__init__()
         self.data = data
         self.seq_len = seq_len
+        assert mode in ["normal", "with_labels"]
+        self.mode = mode
 
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-        full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq
+        if self.mode == "normal":
+            full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
+            return full_seq
+        elif self.mode == "with_labels":
+            x_seq = self.data[rand_start: rand_start + self.seq_len].long()
+            y_seq = self.data[rand_start+1: rand_start + self.seq_len + 1].long()
+            return x_seq, y_seq
+        else:
+            raise ValueError(f'mode {self.mode} not recognized')
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
