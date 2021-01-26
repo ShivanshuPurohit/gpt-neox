@@ -3,6 +3,7 @@
     "gradient_accumulation_steps": 80,
     "gradient_clipping": 1.0,
     "wall_clock_breakdown": true,
+    "zero_allow_untested_optimizer": true,
     "tensorboard": {
       "enabled": true,
       "output_path": "./logs",
@@ -12,8 +13,8 @@
       "type": "OneBitAdam",
       "params": {
         "lr": 2e-4,
-	"freeze_step":2,
-	"cuda-aware":true
+    "freeze_step":2,
+    "cuda_aware":true
       }
     },
     "scheduler": {
