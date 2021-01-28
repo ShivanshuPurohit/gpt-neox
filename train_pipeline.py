@@ -14,7 +14,6 @@ from gpt_neox import (GPTNeoX, AutoregressiveWrapper, TextSamplerDataset,
 from gpt_neox.datasets import GPT2Dataset
 from gpt_neox.data_utils import get_tokenizer
 from gpt_neox.utils import is_main, get_args, get_params, save_ds_checkpoint, load_ds_checkpoint
-from gpt_neox.pipeline_sampler import inference_batch
 
 WORLD_SIZE = os.getenv('WORLD_SIZE')
 
@@ -60,8 +59,8 @@ if __name__ == '__main__':
         heads=params["n_heads"],
         dim_head=params["dim_head"],
         loss_fn = loss_function,
-        num_stages = params.get("pipeline_num_stages", 1),
-        activation_checkpoint_interval=params.get('activation_checkpoint_interval', 2)
+        num_stages = params.get("pipeline_num_stages", 2),
+        activation_checkpoint_interval=params.get('activation_checkpoint_interval', 1)
     )
 
     # prepare data
