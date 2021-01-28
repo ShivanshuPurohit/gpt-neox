@@ -91,7 +91,7 @@ if __name__ == '__main__':
     configure_checkpointing(model)
     current_iteration = load_ds_checkpoint(model, params, iteration=None)
     pbar = trange(current_iteration, params.get('train_steps', 100000), mininterval=10., desc='Training Model', dynamic_ncols=True)
-    val_loader = model._build_data_iter(val_dataset)
+    eval_loader = model._build_data_iter(eval_dataset)
     for i in pbar:
         loss = model.train_batch()
         pbar.set_description(f'Training Loss: {loss.item():.4f}')
@@ -99,4 +99,4 @@ if __name__ == '__main__':
         if not i % params.get('checkpoint_save_frequency', 1000) and i != 0:
             save_ds_checkpoint(i, model, params, params.get('keep_n_latest_checkpoints', 5), IS_MAIN)
         if not i % params.get('evaluate_every', 500) and i != 0:
-            model.eval_batch(val_loader)
+            model.eval_batch(eval_loader)
