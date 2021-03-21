@@ -22,15 +22,15 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .norms import  LayerNorm, RMSNorm, ScaleNorm
 from megatron import get_args
 from megatron import mpu
-from megatron.mpu import LayerNorm, RMSNorm
 from megatron.module import MegatronModule
-from megatron.model.t5rpe import RelativePositionBias
 from megatron.checkpointing import get_checkpoint_version
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.utils import openai_gelu, erf_gelu
+from megatron.model.utils import openai_gelu, erf_gelu, exists
+from megatron.mpu import ParallelRelativePositionBias
 
 import deepspeed
 from deepspeed.ops.sparse_attention import SparseSelfAttention, VariableSparsityConfig
@@ -166,7 +166,7 @@ class ParallelSelfAttention(MegatronModule):
 
     def __init__(self, attention_mask_func, init_method,
                  output_layer_init_method, layer_number, sparse=False,
-                 rpe=False):
+                 rpe=None):
         super(ParallelSelfAttention, self).__init__()
         args = get_args()
         self.fp16 = args.fp16
@@ -176,7 +176,7 @@ class ParallelSelfAttention(MegatronModule):
         self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
-        self.layer_number = max(1, layer_number)
+        self.layer_number = max(1, layer_number)  # TODO: why do we start from 1 here?
         # Per attention head and per partition values.
         world_size = mpu.get_model_parallel_world_size()
         self.hidden_size_per_partition = mpu.divide(args.hidden_size,
@@ -203,17 +203,23 @@ class ParallelSelfAttention(MegatronModule):
 
         self.sparse = sparse
         if self.sparse:
-            assert args.model_parallel_size <= 1, "TODO: sparsity doesn't yet work with mp size > 1"
 
             sparsity_config = VariableSparsityConfig(
-                num_heads=args.num_attention_heads,
+                num_heads=self.num_attention_heads_per_partition,
                 attention="unidirectional"
             )
-
-            self.sparse_attn = SparseSelfAttention(
-                sparsity_config=sparsity_config,
-                max_seq_length=args.seq_length,
-                attn_mask_mode='add')
+            try:
+                self.sparse_attn = SparseSelfAttention(
+                    sparsity_config=sparsity_config,
+                    max_seq_length=args.seq_length,
+                    attn_mask_mode='add',
+                    mpu=mpu)
+            except TypeError:
+                # older versions don't have the mpu arg
+                self.sparse_attn = SparseSelfAttention(
+                    sparsity_config=sparsity_config,
+                    max_seq_length=args.seq_length,
+                    attn_mask_mode='add')
         else:
             self.scale_mask_softmax = FusedScaleMaskSoftmax(
                 self.fp16,
@@ -315,9 +321,6 @@ class ParallelSelfAttention(MegatronModule):
         if get_key_value:
             present = (key_layer, value_layer)
 
-        if self.rpe:
-            rpe = self.rpe(query_layer.size(0), key_layer.size(0))
-
         if not self.sparse:
             # ===================================
             # Raw attention scores. [b, np, s, s]
@@ -373,8 +376,9 @@ class ParallelSelfAttention(MegatronModule):
             # Attention probs and dropout
             # ===========================
 
-            if self.rpe:
-                attention_scores += rpe # [1, np, sq, sk]
+            if exists(self.rpe):
+                rpe = self.rpe(query_layer.size(0), key_layer.size(0))
+                attention_scores += rpe  # [1, np, sq, sk]
 
             # attention scores and attention mask [b, np, sq, sk]
             attention_probs = self.scale_mask_softmax(attention_scores,
@@ -474,7 +478,7 @@ class ParallelTransformerLayer(MegatronModule):
     """
 
     def __init__(self, attention_mask_func, init_method,
-                 output_layer_init_method, layer_number, sparse=False, rpe=False):
+                 output_layer_init_method, layer_number, sparse=False, rpe=None):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -483,12 +487,15 @@ class ParallelTransformerLayer(MegatronModule):
         self.apply_residual_connection_post_layernorm \
             = args.apply_residual_connection_post_layernorm
 
-        if args.rms_norm:
+        if args.norm == "rmsnorm":
             norm = RMSNorm
             eps = args.rms_norm_epsilon
-        else:
+        elif args.norm == "layernorm":
             eps = args.layernorm_epsilon
             norm = LayerNorm
+        elif args.norm == "scalenorm":
+            eps = args.scalenorm_epsilon
+            norm = ScaleNorm
 
         # Layernorm on the input data.
         self.input_layernorm = norm(
@@ -597,11 +604,6 @@ class ParallelTransformer(MegatronModule):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
-        self.rpe = args.rpe
-        rpe_causal = args.rpe_causal
-        rpe_num_buckets = args.rpe_num_buckets
-        rpe_max_distance = args.rpe_max_distance
-
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
         self.checkpoint_num_layers = args.checkpoint_num_layers
@@ -615,15 +617,12 @@ class ParallelTransformer(MegatronModule):
             'number of layers should be divisible by number of unique layers'
         self.param_sharing_style = args.param_sharing_style
 
-        # Duplicate from lines 181 because we need it for rpe setup:
-        world_size = mpu.get_model_parallel_world_size()
-        self.hidden_size_per_partition = mpu.divide(args.hidden_size,
-                                                    world_size)
-        self.num_attention_heads_per_partition = mpu.divide(
-            args.num_attention_heads, world_size)
-
-        if self.rpe:
-            self.rpe = RelativePositionBias(causal=rpe_causal, num_buckets=rpe_num_buckets, max_distance=rpe_max_distance, heads=self.num_attention_heads_per_partition)
+        if args.pos_emb == 'rpe':
+            self.rpe_emb = ParallelRelativePositionBias(causal=True, num_buckets=args.rpe_num_buckets, max_distance=args.rpe_max_distance
+,
+                                            heads=args.num_attention_heads)
+        else:
+            self.rpe_emb = None
 
         # Transformer layers.
         sparsity = args.sparsity
@@ -639,7 +638,7 @@ class ParallelTransformer(MegatronModule):
                 raise ValueError(f'Sparsity type {sparsity} not recognized')
             return ParallelTransformerLayer(
                 attention_mask_func, init_method,
-                output_layer_init_method, layer_number, sparse=sparse, rpe=self.rpe)
+                output_layer_init_method, layer_number, sparse=sparse, rpe=self.rpe_emb)
 
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1) for i in range(self.num_unique_layers)])
@@ -654,12 +653,15 @@ class ParallelTransformer(MegatronModule):
                           flush=True)
 
         # Final layer norm before output.
-        if args.rms_norm:
+        if args.norm == "rmsnorm":
             norm = RMSNorm
             eps = args.rms_norm_epsilon
-        else:
+        elif args.norm == "layernorm":
             eps = args.layernorm_epsilon
             norm = LayerNorm
+        elif args.norm == "scalenorm":
+            eps = args.scalenorm_epsilon
+            norm = ScaleNorm
 
         self.final_layernorm = norm(
             args.hidden_size,

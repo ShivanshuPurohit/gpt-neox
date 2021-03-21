@@ -1,4 +1,16 @@
-# Copyright 2021 (c) Josh Levy-Kramer <josh@levykramer.co.uk>. All rights reserved.
+# Copyright (c) 2021, EleutherAI contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
 import json
@@ -9,6 +21,7 @@ from deepspeed.launcher.runner import DLTS_HOSTFILE
 
 from megatron.utils import obtain_resource_pool
 from megatron.arguments import _get_parser
+import torch
 
 log = logging.getLogger('ConfigMonster')
 
@@ -25,7 +38,7 @@ def _get_megatron_keys(_megatron_keys_exclude):
 
 
 ds_runner_keys = ['hostfile', 'include', 'exclude', 'num_nodes', 'num_gpus', 'master_port', 'master_addr', 'launcher',
-                  'launcher_args']  # handle separately: 'user_script', 'user_args'
+                  'launcher_args', 'detect_nvlink_pairs']  # handle separately: 'user_script', 'user_args'
 
 megatron_keys_exclude = [
     'fp16',  # Duplicated in ds_config
@@ -46,7 +59,7 @@ ds_config_keys = ['train_batch_size', 'train_micro_batch_size_per_gpu', 'gradien
                   'dump_state', 'flops_profiler', 'activation_checkpointing', 'sparse_attention',
                   'zero_allow_untested_optimizer', ]
 
-neox_config_keys = ['wandb_group', 'wandb_team']
+neox_config_keys = ['wandb_group', 'wandb_team', 'git_hash']
 
 ds_runner_keys_exclude = []
 
@@ -82,6 +95,7 @@ OPT_PARAMS_DEFAULTS = {
     "eps": 1e-8,
     "weight_decay": 0,
     "freeze_step": 400,
+    "momentum": 0.0,
     "cuda_aware": False
 }
 
@@ -108,7 +122,7 @@ def _megatron_to_ds_scheduler_args(ds_conf, megatron_conf):
     """
     opt_params = ds_conf.get("optimizer", {"type": OPT_DEFAULT, "params": OPT_PARAMS_DEFAULTS})
     ds_conf["scheduler"] = {
-        "type": "WarmupLR",  # for now this is the only ds scheduler offering decay
+        "type": "WarmupDecayLR",  # for now this is the only ds scheduler offering decay
         "params": {
             "warmup_min_lr": 0,
             "warmup_max_lr": opt_params["params"]["lr"],
@@ -137,6 +151,7 @@ def _set_optimizer_params(ds_conf, megatron_conf):
     megatron_conf['adam-beta1'] = opt_params['params'].get('betas', OPT_PARAMS_DEFAULTS['betas'])[0]
     megatron_conf['adam-beta2'] = opt_params['params'].get('betas', OPT_PARAMS_DEFAULTS['betas'])[1]
     megatron_conf['adam-eps'] = opt_params['params'].get('eps', OPT_PARAMS_DEFAULTS['eps'])
+    megatron_conf['momentum'] = opt_params['params'].get('momentum', OPT_PARAMS_DEFAULTS['momentum'])
 
     assert megatron_conf['lr'] is not None
     if opt_params["type"].lower() == "adam":
@@ -147,6 +162,8 @@ def _set_optimizer_params(ds_conf, megatron_conf):
         megatron_conf['cpu-optimizer'] = True
     elif opt_params["type"].lower() == "cpu_torch_adam":
         megatron_conf['cpu_torch_adam'] = True
+    elif opt_params["type"].lower() == "sm3":
+        megatron_conf['sm3'] = True
     else:
         raise ValueError(
             f'Optimizer type {opt_params["type"]} not recognized, please choose from: \n {OPTIMIZER_OPTIONS}')
@@ -173,7 +190,7 @@ def _set_batch_parameters(world_size, train_batch=None, micro_batch=None, grad_a
     if train_batch is not None and \
             micro_batch is not None and \
             grad_acc is not None:
-        return
+        return train_batch, micro_batch, grad_acc
 
     # gradient_accumulation_steps needs to be set
     elif train_batch is not None and \
@@ -216,6 +233,7 @@ def _configure_train_batch_size(world_size, train_batch=None, micro_batch=None, 
     Modified from deepspeed.DeepSpeedConfig._set_batch_related_parameters.
     """
     train_batch, micro_batch, grad_acc = _set_batch_parameters(world_size, train_batch, micro_batch, grad_acc)
+    print(train_batch, micro_batch, grad_acc)
     _batch_assertion(world_size, train_batch=train_batch, micro_batch=micro_batch, grad_acc=grad_acc)
     return train_batch, micro_batch, grad_acc
 
@@ -262,6 +280,11 @@ class ConfigMonster:
         if args.conf_dir:
             conf_files = [os.path.join(args.conf_dir, f) for f in conf_files]
 
+        # enables us to pass in `small` instead of `small.yml`
+        for cf in conf_files:
+            if not cf.endswith('.yml'):
+                cf += '.yml'
+
         # Load and merge all configuration
         conf = {} if extra_conf is None else extra_conf
         for path in conf_files:
@@ -302,7 +325,11 @@ class ConfigMonster:
             hostfile_path = conf.get('hostfile', DLTS_HOSTFILE)
             resources = obtain_resource_pool(hostfile_path, conf.get('include', ''), conf.get('exclude', ''))
             num_gpus = sum(map(len, resources.values()))
-            log.info(f"Total number of GPUs determined to be: {num_gpus}")
+        else:
+            num_gpus = torch.cuda.device_count()
+            conf["num_gpus"] = num_gpus
+
+        log.info(f"Total number of GPUs determined to be: {num_gpus}")
 
         # get world size in the model/pipe parallel case, the actual `world size` deepspeed uses is the size of the
         # data-parallel group, or (num_gpus / mp_size) / pp_size
@@ -318,7 +345,7 @@ class ConfigMonster:
             'gradient_accumulation_steps'] = _configure_train_batch_size(world_size, conf.get('train_batch_size'),
                                                                          conf.get('train_micro_batch_size_per_gpu'),
                                                                          conf.get('gradient_accumulation_steps'))
-
+        conf['gradient_accumulation_steps'] = int(conf['gradient_accumulation_steps'])
         conf['batch-size'] = conf['train_micro_batch_size_per_gpu']  # we need to pass batch size into megatron
 
         ds_runner_conf = {key: conf[key] for key in ds_runner_keys if key in conf}

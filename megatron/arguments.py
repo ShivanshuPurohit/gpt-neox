@@ -1,6 +1,6 @@
 # coding=utf-8
-#
-# Copyright 2021 Biderman et al. This file is based on code by the authors denoted below and has been modified from its original version.
+# Copyright (c) 2021, EleutherAI contributors
+# This file is based on code by the authors denoted below and has been modified from its original version.
 #
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -21,11 +21,13 @@
 
 import argparse
 import os
+from socket import gethostname
 
 import torch
 from megatron import fused_kernels
 
 import deepspeed
+from megatron.logging import Tee
 
 
 def _get_parser(extra_args_provider=None):
@@ -44,7 +46,6 @@ def _get_parser(extra_args_provider=None):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
-    parser = _add_realm_args(parser)
     parser = _add_zero_args(parser)
     parser = _add_activation_checkpoint_args(parser)
 
@@ -57,6 +58,19 @@ def _get_parser(extra_args_provider=None):
     return parser
 
 
+def configure_distributed_args(args):
+    if args.deepspeed_mpi:
+        from deepspeed.utils.distributed import mpi_discovery
+        mpi_discovery()
+    args.local_rank = int(os.getenv('LOCAL_RANK', '0'))
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
+    if args.rank == 0:
+        print('using world size: {} and model-parallel size: {} '.format(
+            args.world_size, args.model_parallel_size))
+
+
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
     """Parse all arguments."""
@@ -67,13 +81,16 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    # Tee logs to file ASAP
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
+        hostname = gethostname()
+        file_prefix = os.path.join(args.log_dir, hostname)
+        Tee(file_prefix+'_stdout.txt', err=False)
+        Tee(file_prefix + '_stderr.txt', err=True)
+
     # Distributed args.
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
-    if args.rank == 0:
-        print('using world size: {} and model-parallel size: {} '.format(
-            args.world_size, args.model_parallel_size))
+    configure_distributed_args(args)
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -121,9 +138,6 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.num_unique_layers <= args.num_layers
         assert args.num_layers % args.num_unique_layers == 0, \
             'num-layers should be divisible by num-unique-layers.'
-        if args.num_unique_layers < args.num_layers:
-            assert args.DDP_impl == 'local', \
-                'torch-DDP does not work with parameters sharing.'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -178,7 +192,7 @@ def _add_network_size_args(parser):
                             'layers 1 and 2: '
                             '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden-size', type=int, default=None,
-                       help='Tansformer hidden size.')
+                       help='Transformer hidden size.')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
@@ -187,11 +201,9 @@ def _add_network_size_args(parser):
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                             'This is added for computational efficieny reasons.')
-    group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
-                       help='Layer norm epsilon.')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
-                       help='If set, use original BERT residula connection '
+                       help='If set, use original BERT residual connection '
                             'ordering.')
     group.add_argument('--openai-gelu', action='store_true',
                        help='Use OpenAIs GeLU implementation. This option'
@@ -223,6 +235,7 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                             'numerical stability')
+    group.add_argument('--momentum', type=float, default=0.0, help='momentum term for sm3 optimizer')
 
     return parser
 
@@ -234,8 +247,6 @@ def _add_training_args(parser):
                        help='Batch size per model instance (local batch size). '
                             'Global batch size is local batch size times data '
                             'parallel size.')
-    group.add_argument('--onebitadam', action='store_true',
-                       help='Enable one bit adam optimizer [MUST BE USING DEEPSPEED]')
     group.add_argument('--gas', type=int, default=1,
                        help='Gradient accumulation steps (pipeline parallelism only). '
                             'Global batch size is local batch size times data '
@@ -274,14 +285,11 @@ def _add_training_args(parser):
                             'adjust embd dims accordingly)')
     group.add_argument('--no-weight-tying', action='store_true',
                        help='Disables weight tying between embedding weights and final Linear layer')
-    group.add_argument('--sinusoidal-pos-emb', action='store_true',
-                        help='Uses Sinusoidal Positional embedding applied to the inputs instead of learned')                                       
-    group.add_argument('--rpe', action='store_true',
-                        help='T5 relative positional encoding')
-    group.add_argument('--rpe-causal', action='store_true',
-                        help='T5 relative positional encoding causal flag')
+    pos_emb_choices = ['learned', 'sinusoidal', 'rpe', 'none']
+    group.add_argument('--pos-emb', type=str, choices=pos_emb_choices, default='learned',
+                       help=f'Type of positional embedding to use - choose from {pos_emb_choices}')
     group.add_argument('--rpe-num-buckets', type=int, default=32,
-                        help='T5 relative positional encoding number of buckets, default 32.')
+                       help='T5 relative positional encoding number of buckets, default 32.')
     group.add_argument('--rpe-max-distance', type=int, default=128,
                         help='T5 relative positional encoding max distance, default 128.')
     group.add_argument('--bias-dropout-fusion', action='store_true',
@@ -292,13 +300,23 @@ def _add_training_args(parser):
                         none = all regular attn, \
                         all = all sparse attn, \
                         interspersed = sparse on odd layers, dense on even')
-    group.add_argument('--rms-norm', action='store_true',
-                       help='Use root mean squared norm')
-    group.add_argument('--rms-norm-epsilon', type=float, default=1e-8)
+    norm_choices = ['layernorm', 'scalenorm', 'rmsnorm']
+    group.add_argument('--norm', type=str, default='layernorm',
+                        choices=norm_choices, help=f'normalization layer to use. Choose from {norm_choices}')
+    group.add_argument('--scalenorm-epsilon', type=float, default=1e-8,
+                        help='Scalenorm epsilon')
+    group.add_argument('--rms-norm-epsilon', type=float, default=1e-8,
+                        help='RMS norm epsilon')
+    group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
+                       help='Layer norm epsilon.')
     group.add_argument('--cpu-optimizer', action='store_true',
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--onebitadam', action='store_true',
+                       help='Enable one bit adam optimizer [MUST BE USING DEEPSPEED]')
+    group.add_argument('--sm3', action='store_true',
+                       help='Enable sm3 optimizer')
     return parser
 
 
@@ -356,6 +374,8 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', type=int, default=None,
                        help='Number of iterations between checkpoint saves.')
+    group.add_argument('--keep-last-n-checkpoints', type=int, default=None,
+                       help='keep only the last n checkpoints, older ones are deleted')
     group.add_argument('--no-save-optim', action='store_true',
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true',
@@ -411,13 +431,15 @@ def _add_distributed_args(parser):
                        help='Size of the model parallel.')
     group.add_argument('--pipe-parallel-size', type=int, default=0,
                        help='Size of the pipeline parallel. Disable with 0.')
+    group.add_argument('--pipe-partition-method', type=str, default='type:transformer',
+                       help='method used to distribute model layers across pipeline stages. Choose from "parameters", '
+                            'which balances the number of parameters on each pipeline stage, "uniform", which naively '
+                            'balances the number of layers per stage, or "type:[regex]" (in our instance this will '
+                            'basically only be type:transformer), which balances layers whose class names match [regex]'
+                       )
     group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo'],
+                       choices=['nccl', 'gloo', 'mpi'],
                        help='Which backend to use for distributed training.')
-    group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
-                       help='which DistributedDataParallel implementation '
-                            'to use.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -432,14 +454,12 @@ def _add_distributed_args(parser):
 
 def _add_validation_args(parser):
     group = parser.add_argument_group(title='validation')
-
     group.add_argument('--eval-iters', type=int, default=100,
                        help='Number of iterations to run for evaluation'
                             'validation/test for.')
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                             'validation set.')
-
     return parser
 
 
@@ -459,8 +479,6 @@ def _add_data_args(parser):
                        help='Path to the BPE merge file.')
     group.add_argument('--seq-length', type=int, default=None,
                        help="Maximum sequence length to process.")
-    group.add_argument('--mask-prob', type=float, default=0.15,
-                       help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
                        help='Probability of producing a short sequence.')
     group.add_argument('--mmap-warmup', action='store_true',
@@ -469,20 +487,19 @@ def _add_data_args(parser):
                        help="Dataloader number of workers.")
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
-                       choices=['BertWordPieceLowerCase',
-                                'BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                       choices=['GPT2BPETokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset position ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
+                       help='Reset self attention mask after '
                             'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--log-dir', type=str, help='Directory to store logs.', default='./logs')
 
     return parser
 
@@ -499,45 +516,6 @@ def _add_autoresume_args(parser):
     return parser
 
 
-def _add_realm_args(parser):
-    group = parser.add_argument_group(title='realm')
-
-    # network size
-    group.add_argument('--ict-head-size', type=int, default=None,
-                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
-
-    # checkpointing
-    group.add_argument('--ict-load', type=str, default=None,
-                       help='Directory containing an ICTBertModel checkpoint')
-    group.add_argument('--bert-load', type=str, default=None,
-                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
-
-    # data
-    group.add_argument('--titles-data-path', type=str, default=None,
-                       help='Path to titles dataset used for ICT')
-    group.add_argument('--query-in-block-prob', type=float, default=0.1,
-                       help='Probability of keeping query in block for ICT dataset')
-    group.add_argument('--use-one-sent-docs', action='store_true',
-                       help='Whether to use one sentence documents in ICT')
-
-    # training
-    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
-                       help="Which top-k accuracies to report (e.g. '1 5 20')")
-
-    # faiss index
-    group.add_argument('--faiss-use-gpu', action='store_true',
-                       help='Whether create the FaissMIPSIndex on GPU')
-    group.add_argument('--block-data-path', type=str, default=None,
-                       help='Where to save/load BlockData to/from')
-
-    # indexer
-    group.add_argument('--indexer-batch-size', type=int, default=128,
-                       help='How large of batches to use when doing indexing jobs')
-    group.add_argument('--indexer-log-interval', type=int, default=1000,
-                       help='After how many batches should the indexer report progress')
-    return parser
-
-
 def _add_zero_args(parser):
     """Text generate arguments."""
 
@@ -545,8 +523,8 @@ def _add_zero_args(parser):
     group.add_argument("--zero-stage", type=int, default=1.0)
     group.add_argument('--zero-reduce-scatter', action='store_true',
                        help='Use reduce scatter if specified')
-    group.add_argument('--zero-contigious-gradients', action='store_true',
-                       help='Use contigious memory optimizaiton if specified')
+    group.add_argument('--zero-contiguous-gradients', action='store_true',
+                       help='Use contiguous memory optimization if specified')
     group.add_argument("--zero-reduce-bucket-size", type=int, default=0.0)
     group.add_argument("--zero-allgather-bucket-size", type=int, default=0.0)
     return parser
@@ -559,8 +537,8 @@ def _add_activation_checkpoint_args(parser):
                        help='uses activation checkpointing from deepspeed')
     group.add_argument('--partition-activations', action='store_true',
                        help='partition Activations across GPUs before checkpointing.')
-    group.add_argument('--contigious-checkpointing', action='store_true',
-                       help='Contigious memory checkpointing for activatoins.')
+    group.add_argument('--contiguous-checkpointing', action='store_true',
+                       help='Contiguous memory checkpointing for activatoins.')
     group.add_argument('--checkpoint-in-cpu', action='store_true',
                        help='Move the activation checkpoints to CPU.')
     group.add_argument('--synchronize-each-layer', action='store_true',

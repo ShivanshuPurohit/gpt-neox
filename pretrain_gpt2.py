@@ -1,6 +1,5 @@
-# coding=utf-8
-#
-# Copyright 2021 Biderman et al. This file is based on code by the authors denoted below and has been modified from its original version.
+# Copyright (c) 2021, EleutherAI contributors
+# This file is based on code by the authors denoted below and has been modified from its original version.
 #
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -35,6 +34,7 @@ from megatron.utils import get_ltor_masks_and_position_ids, is_local_main, local
 from megatron.utils import reduce_losses
 from megatron.fp16 import fp32_to_fp16
 import wandb
+
 
 def model_provider():
     """Build the model."""

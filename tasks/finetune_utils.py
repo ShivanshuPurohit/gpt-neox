@@ -1,4 +1,7 @@
 # coding=utf-8
+# Copyright (c) 2021, EleutherAI contributors
+# This file is based on code by the authors denoted below and has been modified from its original version.
+#
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -169,7 +172,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               iteration, optimizer.loss_scale,
-                                              report_memory_flag)
+                                              report_memory_flag, model)
 
             # Autoresume
             if args.adlr_autoresume and \
