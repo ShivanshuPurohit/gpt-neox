@@ -127,3 +127,20 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# wandb logs
+wandb/
+
+# data files 
+data/
+checkpoints/
+.vscode/
+*.pt
+*.ckpt
+
+#test logs
+test_checkpoint/
+test_logs/
+logs/
+tensorboard/
+src/
