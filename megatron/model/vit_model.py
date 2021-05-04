@@ -20,7 +20,7 @@ import einops
 import torch
 import torch.nn.functional as F
 from megatron import get_args
-from megatron.model.transformer import ParallelTransformer
+from megatron.model.transformer_vit import ParallelTransformer
 from megatron.model.utils import (
     get_linear_layer,
     init_method_normal,
