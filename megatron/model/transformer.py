@@ -24,10 +24,9 @@ import torch.nn.functional as F
 
 from .norms import LayerNorm, RMSNorm, ScaleNorm
 from megatron import mpu
-from .module import MegatronModule
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.utils import openai_gelu, erf_gelu, exists, attention_mask_func
+from megatron.model.utils import openai_gelu, erf_gelu, exists
 from megatron.model.positional_embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.model.fused_bias_dropout import get_bias_dropout_add, bias_dropout_add_fused_train, \
     bias_dropout_add_fused_inference
@@ -91,7 +90,6 @@ class GEGLU(torch.nn.Module):
 
 class ParallelMLP(torch.nn.Module):
     """MLP.
-
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the
     state back into h hidden dimension. At the end, dropout is also
@@ -180,7 +178,6 @@ class ParallelLinear(torch.nn.Module):
 
 class ParallelSelfAttention(torch.nn.Module):
     """Parallel self-attention layer abstract class.
-
     Self-attention layer takes input with size [b, s, h]
     and returns output of the same size.
     """
@@ -435,7 +432,6 @@ class ParallelSelfAttention(torch.nn.Module):
 
 class ParallelTransformerLayer(torch.nn.Module):
     """A single transformer layer.
-
     Transformer layer takes input with size [b, s, h] and returns an
     output of the same size.
     """
@@ -644,169 +640,3 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         return logits_parallel
 
     return mpu.gather_from_model_parallel_region(logits_parallel)
-
-
-class ParallelTransformer(MegatronModule):
-    """Transformer class."""
-
-    def __init__(self, init_method, output_layer_init_method,
-                 layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding,
-                 pre_process=True, post_process=True):
-        super(ParallelTransformer, self).__init__()
-        args = get_args()
-
-        self.bf16 = args.bf16
-        self.fp32_residual_connection = args.fp32_residual_connection
-        self.pre_process = pre_process
-        self.post_process = post_process
-        self.input_tensor = None
-
-        # Store activation checkpoiting flag.
-        self.checkpoint_activations = args.checkpoint_activations
-        self.checkpoint_num_layers = args.checkpoint_num_layers
-
-        # Number of layers.
-        assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
-            'num_layers must be divisible by pipeline_model_parallel_size'
-        self.num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
-
-        # Transformer layers.
-        def build_layer(layer_number):
-            return ParallelTransformerLayer(
-                init_method,
-                output_layer_init_method,
-                layer_number,
-                layer_type=layer_type,
-                self_attn_mask_type=self_attn_mask_type)
-        if args.virtual_pipeline_model_parallel_size is not None:
-            assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
-                'num_layers_per_stage must be divisible by ' \
-                'virtual_pipeline_model_parallel_size'
-            # Number of layers in each model chunk is the number of layers in the stage,
-            # divided by the number of model chunks in a stage.
-            self.num_layers = self.num_layers // args.virtual_pipeline_model_parallel_size
-            # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
-            # layers to stages like (each list is a model chunk):
-            # Stage 0: [0]  [2]  [4]  [6]
-            # Stage 1: [1]  [3]  [5]  [7]
-            # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
-            # layers to stages like (each list is a model chunk):
-            # Stage 0: [0, 1]  [4, 5]
-            # Stage 1: [2, 3]  [6, 7]
-            offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
-                args.num_layers // args.virtual_pipeline_model_parallel_size) + \
-                (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
-        else:
-            # Each stage gets a contiguous set of layers.
-            offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
-
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
-
-        if self.post_process:
-            # Final layer norm before output.
-            self.final_layernorm = LayerNorm(
-                args.hidden_size,
-                eps=args.layernorm_epsilon)
-
-    def _get_layer(self, layer_number):
-        return self.layers[layer_number]
-
-    def _checkpointed_forward(self, hidden_states, attention_mask,
-                              encoder_output, enc_dec_attn_mask):
-        """Forward method with activation checkpointing."""
-        def custom(start, end):
-            def custom_forward(*inputs):
-                x_ = inputs[0]
-                attention_mask = inputs[1]
-                encoder_output = inputs[2]
-                enc_dec_attn_mask = inputs[3]
-                for index in range(start, end):
-                    layer = self._get_layer(index)
-                    x_ = layer(x_, attention_mask, encoder_output, enc_dec_attn_mask)
-                return x_
-            return custom_forward
-
-        # Make sure memory is freed.
-        mpu.reset_checkpointed_activations_memory_buffer()
-        l = 0
-        while l < self.num_layers:
-            hidden_states = mpu.checkpoint(
-                custom(l, l + self.checkpoint_num_layers),
-                hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
-            l += self.checkpoint_num_layers
-
-        return hidden_states
-
-    def set_input_tensor(self, input_tensor):
-        """Set input tensor to be used instead of forward()'s input.
-        When doing pipeline parallelism the input from the previous
-        stage comes from communication, not from the input, so the
-        model's forward_step_func won't have it. This function is thus
-        used by internal code to bypass the input provided by the
-        forward_step_func"""
-        self.input_tensor = input_tensor
-
-    def forward(self, hidden_states, attention_mask, layer_past=None,
-                get_key_value=False, encoder_output=None, enc_dec_attn_mask=None):
-
-        # Checks.
-        if layer_past is not None:
-            assert get_key_value, \
-                'for not None values in layer_past, ' \
-                'expected get_key_value to be set'
-        if get_key_value:
-            assert not self.checkpoint_activations, \
-                'get_key_value does not work with ' \
-                'activation checkpointing'
-
-        if self.pre_process:
-            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            # If the input flag for fp32 residual connection is set, convert for float.
-            if self.fp32_residual_connection:
-                hidden_states = hidden_states.transpose(0, 1).contiguous().float()
-            # Otherwise, leave it as is.
-            else:
-                hidden_states = hidden_states.transpose(0, 1).contiguous()
-        else:
-            # See set_input_tensor()
-            hidden_states = self.input_tensor
-
-        if encoder_output is not None:
-             encoder_output = encoder_output.transpose(0, 1).contiguous()
-
-        if self.checkpoint_activations:
-            hidden_states = self._checkpointed_forward(hidden_states,
-                                                       attention_mask,
-                                                       encoder_output,
-                                                       enc_dec_attn_mask)
-        else:
-            if get_key_value:
-                presents = []
-            for index in range(self.num_layers):
-                layer = self._get_layer(index)
-                past = None
-                if layer_past is not None:
-                    past = layer_past[index]
-                hidden_states = layer(hidden_states,
-                                      attention_mask,
-                                      encoder_output=encoder_output,
-                                      enc_dec_attn_mask=enc_dec_attn_mask,
-                                      layer_past=past,
-                                      get_key_value=get_key_value)
-                if get_key_value:
-                    hidden_states, present = hidden_states
-                    presents.append(present)
-
-        # Final layer norm.
-        if self.post_process:
-            # Reverting data format change [s b h] --> [b s h].
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-            output = self.final_layernorm(hidden_states)
-        else:
-            output = hidden_states
-        if get_key_value:
-            output = [output, presents]
-
-        return output
