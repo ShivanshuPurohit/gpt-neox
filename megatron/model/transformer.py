@@ -24,9 +24,10 @@ import torch.nn.functional as F
 
 from .norms import LayerNorm, RMSNorm, ScaleNorm
 from megatron import mpu
+from .module import MegatronModule
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.utils import openai_gelu, erf_gelu, exists
+from megatron.model.utils import openai_gelu, erf_gelu, exists, attention_mask_func
 from megatron.model.positional_embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.model.fused_bias_dropout import get_bias_dropout_add, bias_dropout_add_fused_train, \
     bias_dropout_add_fused_inference
