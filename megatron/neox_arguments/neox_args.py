@@ -1,9 +1,12 @@
 import subprocess
 from dataclasses import dataclass
 from .template import NeoXArgsTemplate
-from typing import Literal
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
 
-ATTENTION_TYPE_CHOICES = ['global', 'local', 'sparse_fixed', 'sparse_variable']
+ATTENTION_TYPE_CHOICES = ['global', 'local', 'sparse_fixed', 'sparse_variable', 'bigbird', 'bslongformer', 'gmlp', 'amlp']
 
 
 def get_git_commit_hash():
@@ -28,9 +31,11 @@ class NeoXArgsParallelism(NeoXArgsTemplate):
     Size of the model parallelism.
     """
 
-    pipe_partition_method: str = "type:transformer"
+    pipe_partition_method: str = "type:transformer|mlp"
     """
-    method used to distribute model layers across pipeline stages. Choose from "parameters", which balances the number of parameters on each pipeline stage, "uniform", which naively balances the number of layers per stage, or "type:[regex]" (in our case this will basically only be "type:transformer"), which balances layers whose class names match [regex]
+    method used to distribute model layers across pipeline stages. Choose from "parameters", which balances the number 
+    of parameters on each pipeline stage, "uniform", which naively balances the number of layers per stage, or 
+    "type:[regex]", which balances layers whose class names match [regex]
     """
 
     world_size: int = None
@@ -116,12 +121,7 @@ class NeoXArgsModel(NeoXArgsTemplate):
     """
     Disables weight tying between embedding weights and final Linear layer
     """
-
-    geglu: bool = False
-    """
-    Enable geglu activation function (WARNING: will increase memory usage, adjust embd dims accordingly)
-    """
-
+    
     attention_config: list = None
 
     """
@@ -130,7 +130,7 @@ class NeoXArgsModel(NeoXArgsTemplate):
     The first item in the list specifies the attention type(s), and should be a list of strings. The second item 
     specifies the number of times to repeat those attention types in the full list.
     
-    attention type choices:  [global, local (`sparse_fixed` with no global tokens), sparse_fixed, sparse_variable]
+    attention type choices:  [global, local, sparse_fixed, sparse_variable, bslongformer, bigbird]
                                 
     So a 12 layer network with only global attention could be specified like:
         [[[`global`], 12]]
@@ -188,9 +188,9 @@ class NeoXArgsModel(NeoXArgsTemplate):
     If set, use original BERT residual connection ordering.
     """
 
-    openai_gelu: bool = False
+    activation : Literal["gelu", "geglu", "relu", "softsign", "swish", "mish"] = "gelu"
     """
-    Use OpenAIs GeLU implementation. This option should not be used unless for backward compatibility reasons.
+    Activation function to use - choose from ["gelu", "geglu", "relu", "softsign", "swish", "mish"]
     """
 
     scaled_upper_triang_masked_softmax_fusion: bool = False
@@ -246,6 +246,24 @@ class NeoXArgsModel(NeoXArgsTemplate):
     rotary_emb_base: int = 10000
     """
     Base for rotary positional embedding
+    """
+
+    init_method : Literal["normal", "scaled_normal", "orthogonal", "scaled_orthogonal", "xavier_uniform", "xavier_normal", "wang_init", "small_init"] = "normal"
+    """
+    Init function used on all layers except ff residual outputs - choose from 
+    ["normal", "scaled_normal", "orthogonal", "scaled_orthogonal", "xavier_uniform", "xavier_normal", "wang_init", "small_init"]
+    """
+
+    output_layer_init_method : Literal["normal", "scaled_normal", "orthogonal", "scaled_orthogonal", "xavier_uniform", "xavier_normal", "wang_init", "small_init"] = "scaled_normal"
+    """
+    Init function used for ff residual outputs - choose from 
+    ["normal", "scaled_normal", "orthogonal", "scaled_orthogonal", "xavier_uniform", "xavier_normal", "wang_init", "small_init"]
+    """
+
+    gmlp_attn_dim : int = 64
+    """
+    the dimension of the single head self attention in gmlp model (not used in gpt models).
+    If None - gmlp model doesn't use attention.
     """
 
 
@@ -330,6 +348,12 @@ class NeoXArgsLogging(NeoXArgsTemplate):
 
     wandb_team: str = None
     """Team name for Weights and Biases."""
+
+    wandb_project: str = "neox"
+    """wandb project name"""
+
+    wandb_host: str = "https://api.wandb.ai"
+    """url of the wandb host"""
 
     git_hash: str = get_git_commit_hash()
     """current git hash of repository"""
@@ -495,8 +519,7 @@ class NeoXArgsOther(NeoXArgsTemplate):
 
 @dataclass
 class NeoXArgsTokenizer(NeoXArgsTemplate):
-    tokenizer_type: Literal[
-        "GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "CharLevelTokenizer"] = "GPT2BPETokenizer"
+    tokenizer_type: Literal["GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "CharLevelTokenizer"] = "GPT2BPETokenizer"
     """
     Type of tokenizer to use - should be one of ["GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "CharLevelTokenizer"]
     """
@@ -514,69 +537,69 @@ class NeoXArgsTokenizer(NeoXArgsTemplate):
 
 
 @dataclass
-class NeoXArgsTextgen(NeoXArgsTemplate):
-    text_gen_type: str = None
-    """
-    How to generate text/sample the model.
-    Options: `unconditional`, `input-file`, `interactive`
-    """
-
-    temperature: float = 1.0
-    """
-    Sampling temperature.
-    """
-
-    greedy: bool = False
-    """
-    Use greedy sampling.
-    """
-
-    top_p: float = 0.0
-    """
-    Top p sampling.
-    """
-
-    top_k: int = 0
-    """
-    Top k sampling.
-    """
-
-    out_seq_length: int = 1024
-    """
-    Size of the output generated text.'
-    """
-
-    sample_input_file: str = None
-    """
-    Get input from file instead of interactive mode, each line is an input.
-    """
-
-    sample_output_file: str = None
-    """
-    Output file got from --sample-input-file
-    """
-
-    num_samples: int = 0
-    """
-    Number of samples to generate unconditionally, defaults to 0 and interactive conditional sampling
-    """
-
-    genfile: str = None
-    """
-    Output file when generating unconditionally
-    """
-
-    recompute: bool = False
-    """
-    During generation recompute all attention instead of using previously computed keys/values.
-    """
-
-
-@dataclass
 class NeoXArgsTraining(NeoXArgsTemplate):
     data_path: str = None
     """
     Path to combined dataset to split.
+    """
+
+    train_data_paths: list = None
+    """
+    List of paths to train datasets.
+    """
+
+    test_data_paths: list = None
+    """
+    List of paths to test datasets.
+    """
+
+    valid_data_paths: list = None
+    """
+    List of paths to validation datasets.
+    """
+
+    train_data_weights: list = None
+    """
+    List of 'weights' that decide how often to sample from each training dataset when blending datasets. If None, defaults to equal weighting.
+    Should be a list the same length as `train_data_paths`
+    """
+
+    valid_data_weights: list = None
+    """
+    List of 'weights' that decide how often to sample from each validation dataset when blending datasets. If None, defaults to equal weighting.
+    Should be a list the same length as `valid_data_paths`
+    """
+
+    test_data_weights: list = None
+    """
+    List of 'weights' that decide how often to sample from each test dataset when blending datasets. If None, defaults to equal weighting.
+    Should be a list the same length as `test_data_paths`
+    """
+
+    weight_by_num_documents: bool = False
+    """
+    If True, Builds dataset weights from a multinomial distribution over groups of data according to the number of
+    documents in each group. 
+
+    WARNING: setting this to True will override any user provided weights
+
+    We sample from a group according to the probability p(L) ∝ |L| ** α,
+    where p(L) is the probability of sampling from a given group,
+          |L| is the number of examples in that datapoint,
+          and α is a coefficient that acts to upsample data from underrepresented groups
+
+    Hence α (`alpha`) allows us to control how much to 'boost' the probability of training on low-resource groups.
+
+    See https://arxiv.org/abs/1911.02116 for more details
+    """
+
+    weighted_sampler_alpha: float = 0.3
+    """
+    Alpha value for `weight_by_num_documents`. Only has an effect if `weight_by_num_documents` = True.
+
+    when alpha = 1, the probability of sampling from a given group = n_samples / total_samples
+    as alpha -> 0, the probability of sampling from all groups becomes equal, and number of documents has no effect
+    as alpha -> inf, the probability of sampling from the groups with *the most samples* -> 1
     """
 
     data_impl: str = 'infer'
@@ -597,6 +620,11 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     load: str = None
     """
     Directory containing a model checkpoint.
+    """
+
+    checkpoint_validation_with_forward_pass: bool = False
+    """
+    save input and output of a forward pass with the checkpoint and validate after load
     """
 
     save_interval: int = None
@@ -767,4 +795,54 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     min_scale: float = 1.0
     """
     Minimum loss scale for dynamic loss scale.
+    """
+
+
+@dataclass
+class NeoXArgsTextgen(NeoXArgsTemplate):
+    text_gen_type: str = None
+    """
+    How to generate text/sample the model.
+    Options: `unconditional`, `input-file`, `interactive`
+    """
+
+    temperature: float = 0.0
+    """
+    exponential scaling output distribution ("higher == more risk")
+    """
+
+    top_p: float = 0.0
+    """
+    Top-p (nucleus) sampling chooses from the smallest possible set of tokens whose cumulative probability exceeds the probability top_p.
+    """
+
+    top_k: int = 0
+    """
+    integer between 0 and the models vocab size. Filters out any logits with a probability less than that of the top_kth token.
+    """
+
+    maximum_tokens: int = 64
+    """
+    maximum number of tokens to be generated
+    """
+
+    sample_input_file: str = None
+    """
+    Get input from file instead of interactive mode, each line is an input.
+    """
+
+    sample_output_file: str = None
+    """
+    Output file 
+    """
+
+    num_samples: int = 0
+    """
+    Number of samples to generate unconditionally, defaults to 0 and interactive conditional sampling
+    """
+
+    recompute: bool = False
+    """
+    During generation recompute all attention instead of using previously computed keys/values.
+    Should be set to true for sparse attention models
     """

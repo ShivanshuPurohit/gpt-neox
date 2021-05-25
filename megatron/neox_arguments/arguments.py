@@ -6,11 +6,15 @@ import shortuuid
 import copy
 import torch
 import argparse
+import shutil
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict
 from socket import gethostname
-from typing import Literal, Dict
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
 from deepspeed.launcher.runner import DLTS_HOSTFILE
 from megatron.logging import Tee
 from megatron.tokenizer import build_tokenizer
@@ -58,8 +62,8 @@ BASE_CLASSES = [
     NeoXArgsTraining,
     NeoXArgsParallelism,
     NeoXArgsLogging,
-    NeoXArgsOther,
-    NeoXArgsTextgen
+    NeoXArgsTextgen,
+    NeoXArgsOther
 ]
 
 DEEPSPEED_ARG_CLASSES = [NeoXArgsDeepspeedRunner, NeoXArgsDeepspeedConfig]
@@ -88,7 +92,6 @@ class NeoXArgs(*BASE_CLASSES):
 
         self.enable_logging()
 
-        self.configure_distributed_args()
         self.calculate_derived()
 
         if not self.validate_types():
@@ -96,8 +99,6 @@ class NeoXArgs(*BASE_CLASSES):
 
         if not self.validate_values():
             raise ValueError(self.__class__.__name__ + ".__post_init__() NeoXArgs values cannot be validated")
-
-        self.save_yml()
 
     def build_tokenizer(self):
         self.tokenizer = build_tokenizer(self)
@@ -108,7 +109,7 @@ class NeoXArgs(*BASE_CLASSES):
                 from torch.utils.tensorboard import SummaryWriter
                 print('> setting tensorboard ...')
                 self.tensorboard_writer = SummaryWriter(log_dir=self.tensorboard_dir)
-            except ModuleNotFoundError:
+            except (ModuleNotFoundError, ImportError):
                 print('WARNING: TensorBoard writing requested but is not '
                     'available (are you using PyTorch 1.1.0 or later and do you have tensorboard installed?), '
                     'no TensorBoard logs will be written.', flush=True)
@@ -229,10 +230,25 @@ class NeoXArgs(*BASE_CLASSES):
         # load args
         neox_args = cls.from_ymls(paths_to_yml_files=conf_files, overwrite_values=overwrite_values)
 
+
+        # save a copy of yaml configs to the save directory
+        if neox_args.save is not None:
+            configs_directory = os.path.join(neox_args.save, "configs")
+            
+            # delete the configs subdirectory in save if it already exists
+            # only the latest version of the configs are stored
+            if os.path.isdir(configs_directory):
+                shutil.rmtree(configs_directory)
+
+            # create configs directory and copy config files
+            os.makedirs(configs_directory)
+            for conf_file in conf_files:
+                shutil.copy(conf_file, os.path.join(configs_directory, os.path.basename(conf_file)))
+
         return neox_args
 
     @classmethod
-    def consume_neox_args(cls):
+    def consume_neox_args(cls, overwrite_values=None):
         """
         Deepspeed launcher needs to pass the arguments for `pretrain_gpt2.py` across to all machines.
         
@@ -249,6 +265,8 @@ class NeoXArgs(*BASE_CLASSES):
 
         args_parsed, _ = parser.parse_known_args()
         megatron_config = json.loads(args_parsed.megatron_config)
+        if overwrite_values is not None:
+            megatron_config.update(overwrite_values)
         return cls.from_dict(args_dict=megatron_config)
 
     @staticmethod
@@ -357,19 +375,9 @@ class NeoXArgs(*BASE_CLASSES):
             Tee(file_prefix + '_stdout.txt', err=False)
             Tee(file_prefix + '_stderr.txt', err=True)
 
-    def save_yml(self):
-        """
-        saves the configured value to the configured save directory (if any)
-        """
-        if self.save is not None:
-            os.makedirs(self.save, exist_ok=True)
-            config_file = os.path.join(self.save, 'config.yml')
-            with open(config_file, 'w') as f:
-                json.dump(self.all_config, f, indent=4)
-
     def print(self):
         """Print arguments."""
-        if self.rank == 0:
+        if self.rank == 0 or self.rank is None:
             print('-------------------- arguments --------------------', flush=True)
             str_list = []
             for arg in vars(self):
@@ -406,8 +414,7 @@ class NeoXArgs(*BASE_CLASSES):
         self.update_value("local_rank", int(os.getenv('LOCAL_RANK', '0')))
         self.update_value("rank", int(os.getenv('RANK', '0')))
         self.update_value("world_size", int(os.getenv("WORLD_SIZE", '1')))
-        self.update_value("model_parallel_size", min(self.model_parallel_size, self.world_size))
-
+        
         if self.rank == 0:
             print(
                 self.__class__.__name__ + ".configure_distributed_args() using world size: {} and model-parallel size: {} ".format(
@@ -589,11 +596,21 @@ class NeoXArgs(*BASE_CLASSES):
         assert len(self.attention_config) == self.num_layers, "Length of attention config list must equal num_layers"
         for item in self.attention_config:
             assert item in ATTENTION_TYPE_CHOICES, f"Attention type {item} not recognized"
+        if "gmlp" in self.attention_config or "amlp" in self.attention_config:
+            assert not self.partition_activations, "GMLP Blocks are not compatible with partition activations"
 
         # Sparsity config
         if self.sparsity_config is None:
             # Can't have a default value as an empty dict so need to set it here
             self.update_value("sparsity_config", {})
+
+        # Adding equal dataset weights if none are provided
+        if self.train_data_paths and (self.train_data_weights is None):
+            self.train_data_weights = [1.] * len(self.train_data_paths)
+        if self.valid_data_paths and (self.valid_data_weights is None):
+            self.valid_data_weights = [1.] * len(self.valid_data_paths)
+        if self.test_data_paths and (self.test_data_weights is None):
+            self.test_data_weights = [1.] * len(self.test_data_paths)
 
     ############################################################################################################################
     # start of validation functions
@@ -684,6 +701,30 @@ class NeoXArgs(*BASE_CLASSES):
             logging.error(error_message)
             raise ValueError(error_message)
             return False
+
+        # assert that if one of train/test/valid_data_path are provided, data_path should not be
+        has_separate_path = [data_path is not None for data_path in [self.train_data_paths,
+                                                                     self.valid_data_paths,
+                                                                     self.test_data_paths]]
+        if all(has_separate_path):
+            assert self.data_path is None, "Please provide *either* `data_path` or `train/valid/test_data_path` " \
+                                                "in args "
+
+        # assert that if one of train/test/valid_data_path are provided, all should be
+        assert_error_mess = "One or more of train/valid/test data_path are not provided:\n\t"
+        assert_error_mess += "\n\t".join(
+            [f"{name} data paths: {data_path}," for name, data_path in [['train', self.train_data_paths],
+                                                                        ['valid', self.valid_data_paths],
+                                                                        ['test', self.test_data_paths]]])
+        assert any(has_separate_path) == all(has_separate_path), assert_error_mess
+
+        # assert that if train / valid / test data path(s) and weights are provided, that the paths and the weights should be equal length
+        if self.train_data_paths is not None:
+            assert len(self.train_data_paths) == len(self.train_data_weights)
+        if self.valid_data_paths is not None:
+            assert len(self.valid_data_paths) == len(self.valid_data_weights)
+        if self.test_data_paths is not None:
+            assert len(self.test_data_paths) == len(self.test_data_weights)
 
         return True
 
