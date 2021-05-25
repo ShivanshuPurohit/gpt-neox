@@ -21,59 +21,9 @@
 import math
 
 import torch
-from deepspeed.ops.sparse_attention import SparseSelfAttention, VariableSparsityConfig, FixedSparsityConfig
+from deepspeed.ops.sparse_attention import SparseSelfAttention, VariableSparsityConfig, FixedSparsityConfig, BigBirdSparsityConfig, BSLongformerSparsityConfig
 from deepspeed.ops.sparse_attention.sparsity_config import LocalSlidingWindowSparsityConfig
-
-
-def init_method_normal(sigma):
-    """Init method based on N(0, sigma)."""
-
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
-
-    return init_
-
-
-def scaled_init_method_normal(sigma, num_layers):
-    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
-    std = sigma / math.sqrt(2.0 * num_layers)
-
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
-
-    return init_
-
-
-def attention_mask_func(attention_scores, attention_mask):
-    attention_scores.masked_fill_(attention_mask, -10000.0)
-    return attention_scores
-
-
-def get_linear_layer(rows, columns, init_method):
-    """Simple linear layer with weight initialization."""
-    layer = torch.nn.Linear(rows, columns)
-    init_method(layer.weight)
-    with torch.no_grad():
-        layer.bias.zero_()
-    return layer
-
-
-@torch.jit.script
-def gelu_impl(x):
-    """OpenAI's gelu implementation."""
-    return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x *
-                                       (1.0 + 0.044715 * x * x)))
-
-
-def openai_gelu(x):
-    return gelu_impl(x)
-
-
-# This is actually Python equivalent of torch.nn.functional.gelu(), also with type hints for ONNX exporter
-@torch.jit.script
-def erf_gelu(x):
-    return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype) + torch.ones_like(x).to(dtype=x.dtype))
-
+from megatron.model.norms import LayerNorm, RMSNorm, ScaleNorm
 
 def get_params_for_weight_decay_optimization(module, neox_args):
     """Divide params into with-weight-decay and without-weight-decay groups.
@@ -81,7 +31,6 @@ def get_params_for_weight_decay_optimization(module, neox_args):
     """
     weight_decay_params = {'params': []}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
-    from .transformer import LayerNorm, RMSNorm, ScaleNorm
     for module_ in module.modules():
         if any([isinstance(module_, LayerNorm), isinstance(module_, RMSNorm), isinstance(module_, ScaleNorm)]) or \
                 (neox_args.weight_decay == 0.0):  # also include all parameters here if no weight decay is being done
@@ -206,10 +155,32 @@ def configure_sparse_attention(neox_args, attention_type, num_attention_heads, m
             horizontal_global_attention=False,
         )
     elif attention_type == "local":
+        # can configure with `num_local_blocks` or `num_sliding_window_blocks`
+        num_local_blocks = neox_args.sparsity_config.get("num_local_blocks", neox_args.sparsity_config.get("num_sliding_window_blocks", 4))
         sparsity_config = LocalSlidingWindowSparsityConfig(
             num_heads=num_attention_heads,
             block=neox_args.sparsity_config.get("block", 16),
-            num_sliding_window_blocks=neox_args.sparsity_config.get("num_local_blocks", 4),
+            num_sliding_window_blocks=num_local_blocks,
+            attention='unidirectional'
+        )
+    elif attention_type == "bigbird":
+        sparsity_config = BigBirdSparsityConfig(
+            num_heads=num_attention_heads,
+            block=neox_args.sparsity_config.get("block", 16),
+            different_layout_per_head=neox_args.sparsity_config.get("different_layout_per_head", False),
+            num_random_blocks=neox_args.sparsity_config.get("num_random_blocks", 1),
+            num_sliding_window_blocks=neox_args.sparsity_config.get("num_sliding_window_blocks", 3),
+            num_global_blocks=neox_args.sparsity_config.get("num_global_blocks", 1),
+            attention='unidirectional'
+        )
+    elif attention_type == "bslongformer":
+        sparsity_config = BSLongformerSparsityConfig(
+            num_heads=num_attention_heads,
+            block=neox_args.sparsity_config.get("block", 16),
+            different_layout_per_head=neox_args.sparsity_config.get("different_layout_per_head", False),
+            num_sliding_window_blocks=neox_args.sparsity_config.get("num_sliding_window_blocks", 3),
+            global_block_indices=neox_args.sparsity_config.get("global_block_indices", [0]),
+            global_block_end_indices=neox_args.sparsity_config.get("global_block_end_indices", None),
             attention='unidirectional'
         )
     else:
